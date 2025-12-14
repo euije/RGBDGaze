@@ -8,11 +8,15 @@ services:
     env_file:
       - .env
     image: $DOCKER_IMAGE
-    runtime: $DOCKER_RUNTIME
+    gpus: all
+    # runtime: $DOCKER_RUNTIME/
     shm_size: $DOCKER_SHM_SIZE
     volumes:
       - .:/root/workspace
       - $HOST_DATADRIVE:/root/datadrive
-      - $SSH_AUTH_SOCK:/ssh-agent
+      # - $SSH_AUTH_SOCK:/ssh-agent
       - /run/host-services/ssh-auth.sock:/run/host-services/ssh-auth.sock
-    command: /bin/bash
+    # command: /bin/bash
+    ports:
+    - "8000:8000"
+    command: bash -lc "cd /root/workspace/GazeEstimation && python gaze_server.py --config ./config/rgb.yml --checkpoint /root/datadrive/RGBDGaze/models/SpatialWeightsCNN_gazecapture/pretrained_rgb.pth --host 0.0.0.0 --port 8000"
