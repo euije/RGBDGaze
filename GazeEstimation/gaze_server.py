@@ -17,18 +17,89 @@ from sklearn.model_selection import KFold
 from sklearn.metrics import mean_absolute_error
 from sklearn.svm import SVR
 import numpy as np
+from sklearn.linear_model import Ridge
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import make_pipeline
 
 from PIL import Image, ImageOps
 
-import logging, sys
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)]
-)
+DEBUG_CROP_DIR = "./gaze_debug_crops"
+os.makedirs(DEBUG_CROP_DIR, exist_ok=True)
+
+def _parse_bbox(bbox: str):
+    # "x,y,w,h"
+    x, y, w, h = [int(v) for v in bbox.split(",")]
+    return x, y, w, h
+
+def _clamp_bbox(x: int, y: int, w: int, h: int, W: int, H: int):
+    x = max(0, min(x, W - 1))
+    y = max(0, min(y, H - 1))
+    w = max(1, min(w, W - x))
+    h = max(1, min(h, H - y))
+    return x, y, w, h
+
+def _maybe_save_debug(img_full: Image.Image, img_crop: Image.Image, device: str, tag: str):
+    ts = int(time.time() * 1000)
+    safe = _safe_device_id(device)
+    full_p = os.path.join(DEBUG_CROP_DIR, f"{safe}_{ts}_{tag}_full.jpg")
+    crop_p = os.path.join(DEBUG_CROP_DIR, f"{safe}_{ts}_{tag}_crop.jpg")
+    try:
+        img_full.save(full_p, quality=95)
+        img_crop.save(crop_p, quality=95)
+        logger.info(f"[debug] saved full={full_p} crop={crop_p}")
+    except Exception as e:
+        logger.warning(f"[debug] save failed: {e}")
+
+import logging, sys, os
+from logging.handlers import RotatingFileHandler
+
+# ===== Logging 설정 =====
+LOG_DIR = "./logs"
+os.makedirs(LOG_DIR, exist_ok=True)
+LOG_PATH = os.path.join(LOG_DIR, "gaze_server.log")
+
 logger = logging.getLogger("gaze")
+logger.setLevel(logging.INFO)
+
+fmt = logging.Formatter("%(asctime)s %(levelname)s [%(name)s] %(message)s")
+
+# stdout 로깅 (도커 콘솔용)
+sh = logging.StreamHandler(sys.stdout)
+sh.setFormatter(fmt)
+sh.setLevel(logging.INFO)
+
+# 파일 로깅 (txt처럼 쓸 수 있게)
+fh = RotatingFileHandler(
+    LOG_PATH,
+    maxBytes=10 * 1024 * 1024,  # 10MB
+    backupCount=5,
+    encoding="utf-8"
+)
+fh.setFormatter(fmt)
+fh.setLevel(logging.INFO)
+
+# 중복 방지
+logger.handlers.clear()
+logger.addHandler(sh)
+logger.addHandler(fh)
+logger.propagate = False
+
+logger.info(f"[log] writing to {LOG_PATH}")
+
 
 from collections import defaultdict
+
+def cm_centered_to_px(x_cm: float, y_cm: float,
+                      w_px: float, h_px: float,
+                      w_cm: float, h_cm: float) -> Tuple[float, float]:
+    """
+    inputs: centered cm coords (0,0 at screen center), +x right, +y up
+    outputs: pixel coords (0..w_px, 0..h_px), origin at top-left
+    """
+    sx = (x_cm / w_cm) * w_px + (w_px * 0.5)
+    sy = (h_px * 0.5) - (y_cm / h_cm) * h_px
+    return float(sx), float(sy)
+
 
 def _group_pairs_by_target(pairs, key_round_px: float = 1.0, agg: str = "mean"):
     """
@@ -145,8 +216,11 @@ def build_infer(config_path, ckpt_path, force_cpu=False, feat_layer: Optional[st
 
     def infer_pil(img: Image.Image):
         t0 = time.time()
-        img = ImageOps.mirror(img)
-        x = tfm(img.convert("RGB")).unsqueeze(0).to(device, non_blocking=True)
+
+        img = img.convert("RGB")
+        img = img.transpose(Image.FLIP_LEFT_RIGHT)  # ✅ 학습과 동일하게 좌우반전
+
+        x = tfm(img).unsqueeze(0).to(device, non_blocking=True)
 
         with torch.inference_mode():
             y = model(x)
@@ -204,13 +278,11 @@ def _load_device_blob(device: str) -> Dict[str, Any]:
     path = _model_path(device)
     if not os.path.exists(path):
         return {
-            "pairs": [],          # list of (feat[np.float32], tgtx, tgty)
-            "std_mean": None,
-            "std_std": None,
-            "svr_x": None,
-            "svr_y": None,
+            "pairs": [],
             "trained": False,
             "meta": {},
+            "ridge_x": None,
+            "ridge_y": None,
         }
     with open(path, "rb") as f:
         return pickle.load(f)
@@ -273,13 +345,12 @@ def main():
             blob = _load_device_blob(device)
             blob["pairs"] = []
             blob["trained"] = False
-            blob["svr_x"] = None
-            blob["svr_y"] = None
-            blob["std_mean"] = None
-            blob["std_std"] = None
+            blob["ridge_x"] = None
+            blob["ridge_y"] = None
             blob["meta"] = {"reset_ms": time.time() * 1000.0}
             _save_device_blob(device, blob)
         return {"ok": True, "device": device}
+
 
     @app.post("/calib/add")
     async def calib_add(
@@ -324,110 +395,134 @@ def main():
     @app.post("/calib/finish")
     async def calib_finish(
         device: str = Form(...),
-        C: float = Form(100.0),
-        gamma: float = Form(0.5),   # (linear SVR이면 안씀)
-        eps: float = Form(0.05),
+
+        # ✅ 분리 알파
+        alpha_x: float = Form(3.0),
+        alpha_y: float = Form(3.0),
+
+        # (옵션) 혹시 예전 클라가 alpha 하나만 보내면 둘 다 그 값으로
+        alpha: Optional[float] = Form(None),
     ):
         try:
+            if alpha is not None:
+                alpha_x = float(alpha)
+                alpha_y = float(alpha)
+
             with lock:
                 blob = _load_device_blob(device)
                 pairs = blob.get("pairs", [])
             if len(pairs) < 4:
                 return JSONResponse({"error": f"not enough pairs: {len(pairs)}"}, status_code=400)
 
+            # 13점 대표 feature/pred 만들기 (우리는 pred만 사용)
             F, P, tx, ty, counts = _group_pairs_by_target(pairs, key_round_px=1.0, agg="mean")
             logger.info(f"[calib] raw_pairs={len(pairs)} grouped_points={len(tx)} counts={counts}")
 
             if len(tx) < 4:
                 return JSONResponse({"error": f"not enough grouped points: {len(tx)}"}, status_code=400)
 
-            # ✅ 픽셀 타깃 -> centered (origin=center, +y=up)
-            # TODO: 하드코딩 말고 Android에서 screen_w/h를 받아서 저장하는 게 정석
-            w = 1080.0
-            h = 2640.0
-            tx_c = tx - (w * 0.5)
-            ty_c = (h * 0.5) - ty  # y 뒤집기
+            # screen size (정석은 Android에서 받아오기)
+            w = 1440.0
+            h = 3040.0
 
-            # feature 표준화
-            mean, std = _fit_standardizer(F)
-            Z = _zscore(F, mean, std)
-            D = Z.shape[1]
+            X = P.astype(np.float32)  # [K,2]
+            if not np.all(np.isfinite(X)):
+                return JSONResponse({"error": "pred contains NaN/inf"}, status_code=400)
 
-            # ✅ 학습도 centered 기준
-            svr_x = SVR(kernel="linear", C=float(C), epsilon=float(eps))
-            svr_y = SVR(kernel="linear", C=float(C), epsilon=float(eps))
-            svr_x.fit(Z, tx_c)
-            svr_y.fit(Z, ty_c)
+            def eval_coord(coord: str):
+                # centered targets
+                tx_c = tx - (w * 0.5)
+                if coord == "centered_y_down":
+                    ty_c = ty - (h * 0.5)        # +y = down
+                else:
+                    ty_c = (h * 0.5) - ty        # +y = up
 
-            # ---- train-set sanity (centered 기준 MAE) ----
-            px_c = svr_x.predict(Z)
-            py_c = svr_y.predict(Z)
+                # ✅ 2개의 1D Ridge (alpha 분리)
+                rx = Ridge(alpha=float(alpha_x), fit_intercept=True)
+                ry = Ridge(alpha=float(alpha_y), fit_intercept=True)
+                rx.fit(X, tx_c)
+                ry.fit(X, ty_c)
 
-            mae_x_c = float(np.mean(np.abs(px_c - tx_c)))
-            mae_y_c = float(np.mean(np.abs(py_c - ty_c)))
+                # train sanity
+                px = rx.predict(X).astype(np.float32)
+                py = ry.predict(X).astype(np.float32)
+                mae_x = float(np.mean(np.abs(px - tx_c)))
+                mae_y = float(np.mean(np.abs(py - ty_c)))
+                std_x = float(px.std())
+                std_y = float(py.std())
 
-            logger.info(
-                f"[calib] device={device} "
-                f"tgt_mean_c=({float(tx_c.mean()):.2f},{float(ty_c.mean()):.2f}) "
-                f"pred_mean_c=({float(px_c.mean()):.2f},{float(py_c.mean()):.2f}) "
-                f"mae_c=({mae_x_c:.2f},{mae_y_c:.2f}) "
-                f"pred_std_c=({float(px_c.std()):.2f},{float(py_c.std()):.2f})"
-            )
+                # corr (pred raw vs target centered)
+                corr_x = float(np.corrcoef(X[:, 0], tx_c)[0, 1])
+                corr_y = float(np.corrcoef(X[:, 1], ty_c)[0, 1])
 
-            # pred 통계 / 상관 (진단용)
-            logger.info(
-                f"[calib] pred_range_x=({P[:,0].min():.2f},{P[:,0].max():.2f}) "
-                f"pred_range_y=({P[:,1].min():.2f},{P[:,1].max():.2f})"
-            )
+                # LOOCV
+                loo = LeaveOneOut()
+                mae_xs, mae_ys = [], []
+                for tr, te in loo.split(X):
+                    X_tr, X_te = X[tr], X[te]
+                    tx_tr, tx_te = tx_c[tr], tx_c[te]
+                    ty_tr, ty_te = ty_c[tr], ty_c[te]
 
-            corr_x = float(np.corrcoef(P[:, 0], tx_c)[0, 1])
-            corr_y = float(np.corrcoef(P[:, 1], ty_c)[0, 1])
-            logger.info(f"[calib] corr(pred_x,tx_c)={corr_x:.3f} corr(pred_y,ty_c)={corr_y:.3f}")
+                    mx = Ridge(alpha=float(alpha_x), fit_intercept=True)
+                    my = Ridge(alpha=float(alpha_y), fit_intercept=True)
+                    mx.fit(X_tr, tx_tr)
+                    my.fit(X_tr, ty_tr)
 
-            # ---- LOOCV (centered 기준) ----
-            loo = LeaveOneOut()
-            mae_xs, mae_ys = [], []
-            for tr, te in loo.split(Z):
-                Z_tr, Z_te = Z[tr], Z[te]
-                tx_tr, tx_te = tx_c[tr], tx_c[te]
-                ty_tr, ty_te = ty_c[tr], ty_c[te]
+                    px_te = float(mx.predict(X_te)[0])
+                    py_te = float(my.predict(X_te)[0])
+                    mae_xs.append(abs(px_te - float(tx_te[0])))
+                    mae_ys.append(abs(py_te - float(ty_te[0])))
 
-                m_x = SVR(kernel="linear", C=float(C), epsilon=float(eps))
-                m_y = SVR(kernel="linear", C=float(C), epsilon=float(eps))
-                m_x.fit(Z_tr, tx_tr)
-                m_y.fit(Z_tr, ty_tr)
+                loocv_x = float(np.mean(mae_xs))
+                loocv_y = float(np.mean(mae_ys))
 
-                px_te = m_x.predict(Z_te)
-                py_te = m_y.predict(Z_te)
-                mae_xs.append(mean_absolute_error(tx_te, px_te))
-                mae_ys.append(mean_absolute_error(ty_te, py_te))
+                return {
+                    "coord": coord,
+                    "ridge_x": rx,
+                    "ridge_y": ry,
+                    "train_mae": (mae_x, mae_y),
+                    "pred_std": (std_x, std_y),
+                    "loocv_mae": (loocv_x, loocv_y),
+                    "corr": (corr_x, corr_y),
+                }
 
-            loocv_x = float(np.mean(mae_xs))
-            loocv_y = float(np.mean(mae_ys))
-            logger.info(f"[calib] LOOCV_MAE_c=({loocv_x:.1f}px, {loocv_y:.1f}px)")
+            res_up   = eval_coord("centered_y_up")
+            res_down = eval_coord("centered_y_down")
 
-            # ✅ 모델 저장: centered 좌표계를 쓴다는 메타도 같이 저장
+            logger.info(f"[calib][y_up]   train_mae_c=({res_up['train_mae'][0]:.1f},{res_up['train_mae'][1]:.1f}) "
+                        f"pred_std_c=({res_up['pred_std'][0]:.1f},{res_up['pred_std'][1]:.1f}) "
+                        f"LOOCV_MAE_c=({res_up['loocv_mae'][0]:.1f},{res_up['loocv_mae'][1]:.1f}) "
+                        f"corr=({res_up['corr'][0]:.3f},{res_up['corr'][1]:.3f})")
+
+            logger.info(f"[calib][y_down] train_mae_c=({res_down['train_mae'][0]:.1f},{res_down['train_mae'][1]:.1f}) "
+                        f"pred_std_c=({res_down['pred_std'][0]:.1f},{res_down['pred_std'][1]:.1f}) "
+                        f"LOOCV_MAE_c=({res_down['loocv_mae'][0]:.1f},{res_down['loocv_mae'][1]:.1f}) "
+                        f"corr=({res_down['corr'][0]:.3f},{res_down['corr'][1]:.3f})")
+
+            # ✅ 선택 기준: (loocv_x + loocv_y) 최소
+            score_up   = res_up["loocv_mae"][0] + res_up["loocv_mae"][1]
+            score_down = res_down["loocv_mae"][0] + res_down["loocv_mae"][1]
+            best = res_up if score_up <= score_down else res_down
+
+            logger.info(f"[calib] choose_coord={best['coord']} alpha_x={alpha_x} alpha_y={alpha_y}")
+
             with lock:
                 blob = _load_device_blob(device)
-                blob["std_mean"] = mean
-                blob["std_std"] = std
-                blob["svr_x"] = svr_x
-                blob["svr_y"] = svr_y
+                blob["ridge_x"] = best["ridge_x"]
+                blob["ridge_y"] = best["ridge_y"]
                 blob["trained"] = True
                 blob["meta"] = {
                     "trained_ms": time.time() * 1000.0,
                     "n_pairs_raw": len(pairs),
                     "n_points": int(len(tx)),
-                    "C": float(C),
-                    "eps": float(eps),
-                    "feat_dim": int(D),
-                    "agg": "mean",
-                    "key_round_px": 1.0,
-                    "coord": "centered_y_up",
+                    "alpha_x": float(alpha_x),
+                    "alpha_y": float(alpha_y),
+                    "coord": best["coord"],
                     "screen_w": w,
                     "screen_h": h,
-                    "train_mae_c": [mae_x_c, mae_y_c],
-                    "loocv_mae_c": [loocv_x, loocv_y],
+                    "train_mae_c": [float(best["train_mae"][0]), float(best["train_mae"][1])],
+                    "loocv_mae_c": [float(best["loocv_mae"][0]), float(best["loocv_mae"][1])],
+                    "corr_pred_vs_tgt_c": [float(best["corr"][0]), float(best["corr"][1])],
                 }
                 _save_device_blob(device, blob)
 
@@ -441,55 +536,97 @@ def main():
     async def infer_api(
         device: str = Form(...),
         image: UploadFile = File(...),
-        bbox: Optional[str] = Form(default=None),
+        bbox: Optional[str] = Form(default=None),   # 원본 프레임 기준 bbox: "x,y,w,h"
+        debug_crop: bool = Form(False),
         return_feat: bool = Form(False),
     ):
-        """
-        TRACK: (image -> feat) -> (device별 std) -> (device별 SVR) -> screen(x,y)
-        """
         try:
+            # ----- 이미지 로드 + (선택) crop -----
             raw = await image.read()
-            img = Image.open(io.BytesIO(raw)).convert("RGB")
+            img_full = Image.open(io.BytesIO(raw)).convert("RGB")
+
+            img_in = img_full
+            used_bbox = None
+
             if bbox:
-                x, y, w, h = [int(v) for v in bbox.split(",")]
-                img = img.crop((x, y, x + w, y + h))
+                x, y, w, h = _parse_bbox(bbox)
+                W, H = img_full.size
+                x, y, w, h = _clamp_bbox(x, y, w, h, W, H)
+                used_bbox = (x, y, w, h)
 
-            pred, feat, dt_ms, devtype, feat_layer = infer(img)
-            if feat is None:
-                return JSONResponse({"error": "feature hook returned None"}, status_code=400)
+                img_crop = img_full.crop((x, y, x + w, y + h))
+                img_in = img_crop
 
+                if debug_crop:
+                    _maybe_save_debug(img_full, img_crop, device=device, tag="infer")
+
+            # ----- RGBDGaze 모델 추론 (raw pred) -----
+            pred, feat, dt_ms, devtype, feat_layer = infer(img_in)
+
+            if pred is None or len(pred) != 2:
+                return JSONResponse({"error": f"bad pred: {pred}"}, status_code=400)
+
+            X = np.array(pred, np.float32)[None, :]   # [1,2]
+
+            # ----- 디바이스별 Ridge 로드 -----
             with lock:
                 blob = _load_device_blob(device)
 
-            if not blob.get("trained", False) or blob.get("svr_x", None) is None:
-                return JSONResponse({"error": f"device '{device}' not calibrated"}, status_code=400)
+            if (not blob.get("trained", False)
+                or blob.get("ridge_x", None) is None
+                or blob.get("ridge_y", None) is None):
+                return JSONResponse(
+                    {"error": f"device '{device}' not calibrated"},
+                    status_code=400
+                )
 
-            mean = blob["std_mean"]
-            std = blob["std_std"]
-            Z = _zscore(feat[None, :], mean, std)  # [1,D]
+            rx = blob["ridge_x"]
+            ry = blob["ridge_y"]
+            meta = blob.get("meta", {})
 
-            sx_c = float(blob["svr_x"].predict(Z)[0])
-            sy_c = float(blob["svr_y"].predict(Z)[0])
+            w = float(meta.get("screen_w", 1440.0))
+            h = float(meta.get("screen_h", 3040.0))
+            coord = meta.get("coord", "centered_y_up")
 
-            w = 1080.0
-            h = 2640.0
+            # ----- Ridge: raw pred → centered px -----
+            sx_c = float(rx.predict(X)[0])   # center 기준 x
+            sy_c = float(ry.predict(X)[0])   # center 기준 y (sign은 coord에 따라 해석)
+
+            # ----- centered px → screen px -----
             sx = sx_c + (w * 0.5)
-            sy = (h * 0.5) - sy_c
+            if coord == "centered_y_down":
+                # center (0,0) 에서 +y가 아래
+                sy = sy_c + (h * 0.5)
+            else:
+                # center (0,0) 에서 +y가 위
+                sy = (h * 0.5) - sy_c
 
             out = {
                 "device": device,
-                "screen": [sx, sy],
-                "screen_centered": [sx_c, sy_c],
-                "pred": pred,               # 디버그용
+                "screen": [sx, sy],                      # 최종 gaze px
+                "screen_centered": [sx_c, sy_c],         # center 기준 px
+                "pred": pred,                            # raw 모델 출력 (cm 해석이든 뭐든)
                 "ms": dt_ms,
                 "device_exec": devtype,
                 "feat_layer": feat_layer,
+                "coord": coord,
+
+                # 디버그용 메타
+                "used_bbox": list(used_bbox) if used_bbox else None,
+                "input_size": list(img_in.size),
+                "full_size": list(img_full.size),
             }
-            if return_feat:
+
+            if return_feat and feat is not None:
                 out["feat"] = feat.tolist()
+
             return JSONResponse(out)
+
         except Exception as e:
             return JSONResponse({"error": str(e)}, status_code=400)
+
+
+
 
     uvicorn.run(app, host=args.host, port=args.port, log_level="info", access_log=True)
 
