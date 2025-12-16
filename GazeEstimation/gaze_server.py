@@ -23,6 +23,15 @@ from sklearn.pipeline import make_pipeline
 
 from PIL import Image, ImageOps
 
+from fastapi import FastAPI, UploadFile, File, Form
+from fastapi.responses import JSONResponse
+import uvicorn
+import json
+import threading
+import time
+
+import window_analyze  # 방금 만든 모듈
+
 DEBUG_CROP_DIR = "./gaze_debug_crops"
 os.makedirs(DEBUG_CROP_DIR, exist_ok=True)
 
@@ -58,8 +67,46 @@ LOG_DIR = "./logs"
 os.makedirs(LOG_DIR, exist_ok=True)
 LOG_PATH = os.path.join(LOG_DIR, "gaze_server.log")
 
+# ✅ 스크린샷 전용 디렉토리 + ndjson 경로
+# 개별 로그 파일 경로
+SCREENSHOT_LOG_PATH = os.path.join(LOG_DIR, "screenshot.ndjson")
+TOUCH_LOG_PATH      = os.path.join(LOG_DIR, "touch.ndjson")
+GAZE_LOG_PATH       = os.path.join(LOG_DIR, "gaze.ndjson")
+
+# 스크린샷 이미지 실제 파일 저장 디렉터리
+SCREENSHOT_DIR = os.path.join(LOG_DIR, "screenshots")
+os.makedirs(SCREENSHOT_DIR, exist_ok=True)
+
 logger = logging.getLogger("gaze")
 logger.setLevel(logging.INFO)
+
+def _make_json_logger(name: str, path: str) -> logging.Logger:
+    """
+    각 줄이 순수 JSON string 이 되도록 Formatter를 '%(message)s'로 맞춘 로거.
+    """
+    lg = logging.getLogger(name)
+    lg.setLevel(logging.INFO)
+    lg.handlers.clear()
+    fh = RotatingFileHandler(
+        path,
+        maxBytes=50 * 1024 * 1024,  # 50MB
+        backupCount=3,
+        encoding="utf-8"
+    )
+    fh.setFormatter(logging.Formatter("%(message)s"))  # 타임스탬프/레벨 안 붙이고 순수 message만
+    fh.setLevel(logging.INFO)
+    lg.addHandler(fh)
+    lg.propagate = False
+    return lg
+
+screenshot_logger = _make_json_logger("gaze.screenshot", SCREENSHOT_LOG_PATH)
+touch_logger      = _make_json_logger("gaze.touch", TOUCH_LOG_PATH)
+gaze_logger       = _make_json_logger("gaze.gaze", GAZE_LOG_PATH)
+
+logger.info(f"[log] screenshot.ndjson -> {SCREENSHOT_LOG_PATH}")
+logger.info(f"[log] touch.ndjson      -> {TOUCH_LOG_PATH}")
+logger.info(f"[log] gaze.ndjson       -> {GAZE_LOG_PATH}")
+logger.info(f"[log] screenshot images -> {SCREENSHOT_DIR}")
 
 fmt = logging.Formatter("%(asctime)s %(levelname)s [%(name)s] %(message)s")
 
@@ -86,6 +133,40 @@ logger.propagate = False
 
 logger.info(f"[log] writing to {LOG_PATH}")
 
+def _current_session_id(device: str) -> Optional[str]:
+    with session_lock:
+        st = SESSIONS.get(device)
+        if st and st.get("active"):
+            return st["session_id"]
+    return None
+
+def _session_root(device: str, session_id: str) -> str:
+    d = os.path.join(LOG_DIR, device, session_id)
+    os.makedirs(d, exist_ok=True)
+    return d
+
+def _sess_screenshot_ndjson(device: str, session_id: str) -> str:
+    root = _session_root(device, session_id)
+    return os.path.join(root, "screenshot.ndjson")
+
+def _sess_touch_ndjson(device: str, session_id: str) -> str:
+    root = _session_root(device, session_id)
+    return os.path.join(root, "touch.ndjson")
+
+def _sess_gaze_ndjson(device: str, session_id: str) -> str:
+    root = _session_root(device, session_id)
+    return os.path.join(root, "gaze.ndjson")
+
+def _sess_screenshot_img_dir(device: str, session_id: str) -> str:
+    root = _session_root(device, session_id)
+    d = os.path.join(root, "screenshots")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+# ---- Session / window LLM 상태 ----
+session_lock = threading.Lock()
+SESSIONS: Dict[str, Dict[str, Any]] = {}
 
 from collections import defaultdict
 
@@ -302,6 +383,53 @@ def _fit_standardizer(F: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
 def _zscore(f: np.ndarray, mean: np.ndarray, std: np.ndarray) -> np.ndarray:
     return ((f - mean) / std).astype(np.float32)
 
+## LLM
+def _session_worker(device: str):
+    logger.info(f"[session] worker started for device={device}")
+    while True:
+        time.sleep(20.0)  # 20초 주기
+
+        with session_lock:
+            state = SESSIONS.get(device)
+            if not state or not state.get("active", False):
+                logger.info(f"[session] worker exit for device={device}")
+                break
+
+            session_id = state["session_id"]
+            session_goal = state["session_goal"]
+            start_ms = int(state["start_ms"])
+            wlen_ms = int(state.get("window_ms", 20_000))
+            win_idx = state["next_window_idx"]
+            state["next_window_idx"] = win_idx + 1
+
+        t_start_ms = start_ms + win_idx * wlen_ms
+        t_end_ms = t_start_ms + wlen_ms
+
+        logger.info(
+            f"[session] running window idx={win_idx} "
+            f"t=[{t_start_ms},{t_end_ms}) for device={device}"
+        )
+
+        try:
+            res = window_analyze.analyze_window(
+                device=device,
+                session_id=session_id,
+                session_goal=session_goal,
+                window_index=win_idx,
+                t_start_ms=t_start_ms,
+                t_end_ms=t_end_ms,
+                base_log_dir=LOG_DIR,
+            )
+            if res is None:
+                logger.info(
+                    f"[session] window idx={win_idx} produced no result (no data); continue"
+                )
+        except Exception as e:
+            logger.error(
+                f"[session] window analyze failed for device={device}, idx={win_idx}: {e}"
+            )
+            continue
+
 
 # ----------------------------
 # FastAPI
@@ -327,6 +455,233 @@ def main():
     @app.get("/health")
     def health():
         return {"ok": True}
+
+    @app.post("/session/start")
+    async def session_start(
+        device: str = Form(...),
+        session_goal: str = Form(...),
+        session_id: Optional[str] = Form(None),
+        session_start_ms: Optional[int] = Form(None),
+        window_ms: int = Form(20_000),
+    ):
+        """
+        세션 시작:
+          - device별 세션 상태 저장
+          - 10초마다 window_analyze.analyze_window를 호출하는 워커 스레드 시작
+        클라이언트는:
+          - session_goal: 유저가 설정한 세션 목표 (예: "DM 3명에게 답장")
+          - session_start_ms: 안드로이드 System.currentTimeMillis() 전달 추천
+        """
+        now_ms = int(time.time() * 1000.0)
+        if session_id is None:
+            session_id = f"{_safe_device_id(device)}_{now_ms}"
+
+        if session_start_ms is None:
+            session_start_ms = now_ms
+
+        with session_lock:
+            # 기존 세션 있으면 비활성화
+            old = SESSIONS.get(device)
+            if old and old.get("active", False):
+                old["active"] = False
+
+            state = {
+                "active": True,
+                "session_id": session_id,
+                "session_goal": session_goal,
+                "start_ms": int(session_start_ms),
+                "window_ms": int(window_ms),
+                "next_window_idx": 0,
+            }
+            SESSIONS[device] = state
+
+            th = threading.Thread(
+                target=_session_worker,
+                args=(device,),
+                daemon=True,
+            )
+            state["thread"] = th
+            th.start()
+
+        logger.info(
+            f"[session] start device={device} session_id={session_id} "
+            f"goal={session_goal!r} start_ms={session_start_ms} window_ms={window_ms}"
+        )
+
+        return {
+            "ok": True,
+            "device": device,
+            "session_id": session_id,
+            "session_goal": session_goal,
+            "start_ms": session_start_ms,
+            "window_ms": window_ms,
+        }
+
+    @app.post("/session/stop")
+    async def session_stop(
+        device: str = Form(...),
+    ):
+        """
+        세션 종료:
+          - active 플래그 false로 설정
+          - 워커 스레드는 다음 루프에서 종료
+        """
+        with session_lock:
+            state = SESSIONS.get(device)
+            if not state:
+                return {"ok": False, "error": "no session for device"}
+
+            state["active"] = False
+            session_id = state.get("session_id")
+
+        logger.info(f"[session] stop device={device} session_id={session_id}")
+        return {"ok": True, "device": device, "session_id": session_id}
+
+
+
+    @app.post("/log/screenshot")
+    async def log_screenshot(
+        device: str = Form(...),
+        ts_ms: int = Form(...),
+        meta: str = Form(...),
+        image: UploadFile = File(...),
+    ):
+        """
+        1) 업로드된 JPEG를 ./logs/<device>/<session>/screenshots/ 아래에 저장
+        2) screenshot.ndjson 에 한 줄씩 append
+        """
+        try:
+            # 1) 이미지 저장
+            raw = await image.read()
+            ts = int(ts_ms)
+
+            session_id = _current_session_id(device)
+            if session_id is None:
+                # 세션 없는 상태에서 들어온 캡처는 무시하거나, 별도 orphan 폴더에 저장
+                logger.warning(f"[log] screenshot with no active session device={device}")
+                return {"ok": False, "error": "no_active_session"}
+
+            img_dir = _sess_screenshot_img_dir(device, session_id)
+            img_path = os.path.join(img_dir, f"{ts_ms}.jpg")
+
+            # 🔧 여기서 file → image, 그리고 이미 읽어둔 raw 사용
+            with open(img_path, "wb") as out:
+                out.write(raw)
+
+            # 2) 메타 JSON 파싱
+            try:
+                meta_obj = json.loads(meta)
+            except Exception as e:
+                logger.warning(f"[screenshot] meta JSON parse failed: {e} meta={meta!r}")
+                meta_obj = {}
+
+            # 3) ndjson 한 줄 append
+            rec = {
+                "device": device,
+                "session_id": session_id,
+                "ts_ms": ts,
+                "image_path": img_path,
+                "meta": meta_obj,
+            }
+
+            nd = _sess_screenshot_ndjson(device, session_id)
+            with open(nd, "a", encoding="utf-8") as f:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+            return {"ok": True, "ts_ms": ts}
+
+        except Exception as e:
+            logger.exception(f"[screenshot] failed: {e}")
+            return JSONResponse({"error": str(e)}, status_code=400)
+
+
+
+    @app.post("/log/touch")
+    async def log_touch(
+        device: str = Form(...),
+        ts_ms: Optional[float] = Form(None),     # 이 호출의 기준 timestamp
+        payload: str = Form(...),               # JSON string (events 리스트 등)
+    ):
+        """
+        10초 윈도우 안에서 발생한 터치/스크롤 이벤트들을 한 번에 보내도 되고,
+        1초마다 쪼개서 보내도 됨. payload는 JSON string으로 통째로 로그에 저장.
+        예: {"events":[{"t_ms":..., "type":"down","x":..,"y":..}, ...]}
+        """
+        try:
+            now_ms = int(time.time() * 1000.0)
+            ts = int(ts_ms) if ts_ms is not None else now_ms
+
+            session_id = _current_session_id(device)
+            if session_id is None:
+                # 세션 없는 상태에서 들어온 캡처는 무시하거나, 별도 orphan 폴더에 저장
+                logger.warning(f"[log] touch with no active session device={device}")
+                return {"ok": False, "error": "no_active_session"}
+
+            try:
+                payload_obj = json.loads(payload)
+            except Exception:
+                payload_obj = {"raw": payload}
+
+            record = {
+                "ts_ms": ts,
+                "session_id": session_id,
+                "server_ts_ms": now_ms,
+                "device": device,
+                "payload": payload_obj,
+            }
+
+            nd = _sess_touch_ndjson(device, session_id)
+            with open(nd, "a", encoding="utf-8") as f:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+            
+            return {"ok": True}
+        except Exception as e:
+            logger.exception("[log_touch] failed")
+            return JSONResponse({"error": str(e)}, status_code=400)
+
+
+    @app.post("/log/gaze")
+    async def log_gaze(
+        device: str = Form(...),
+        ts_ms: Optional[float] = Form(None),
+        payload: str = Form(...),
+    ):
+        """
+        Gaze 샘플들을 JSON string으로 받아서 그대로 저장.
+        예: {"samples":[{"t_ms":..., "x_px":..., "y_px":...}, ...]}
+        """
+        try:
+            now_ms = int(time.time() * 1000.0)
+            ts = int(ts_ms) if ts_ms is not None else now_ms
+
+            session_id = _current_session_id(device)
+            if session_id is None:
+                # 세션 없는 상태에서 들어온 캡처는 무시하거나, 별도 orphan 폴더에 저장
+                logger.warning(f"[log] gaze with no active session device={device}")
+                return {"ok": False, "error": "no_active_session"}
+
+            try:
+                payload_obj = json.loads(payload)
+            except Exception:
+                payload_obj = {"raw": payload}
+
+            record = {
+                "ts_ms": ts,
+                "session_id": session_id,
+                "server_ts_ms": now_ms,
+                "device": device,
+                "payload": payload_obj,
+            }
+
+            nd = _sess_gaze_ndjson(device, session_id)
+            with open(nd, "a", encoding="utf-8") as f:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+            return {"ok": True}
+        except Exception as e:
+            logger.exception("[log_gaze] failed")
+            return JSONResponse({"error": str(e)}, status_code=400)
+
 
     @app.get("/calib/status")
     def calib_status(device: str):
@@ -624,6 +979,87 @@ def main():
 
         except Exception as e:
             return JSONResponse({"error": str(e)}, status_code=400)
+
+
+    from collections import Counter
+
+    @app.get("/session/stats")
+    def session_stats(
+        device: str,
+        session_id: Optional[str] = None,
+    ):
+        """
+        현재 세션(또는 지정된 session_id)에 대해
+        window_llm.ndjson을 읽어서 screen_type 분포를 계산.
+        overlay는 이걸 주기적으로 폴링해서 %를 그려주면 됨.
+        """
+        # 1) 세션 ID 결정
+        with session_lock:
+            state = SESSIONS.get(device)
+
+        if session_id is None:
+            if not state:
+                return {
+                    "ok": False,
+                    "ready": False,
+                    "reason": "no_session_for_device",
+                }
+            session_id = state.get("session_id")
+
+        if not session_id:
+            return {
+                "ok": False,
+                "ready": False,
+                "reason": "no_session_id",
+            }
+
+        # 2) window_llm.ndjson 경로
+        path = window_analyze._window_llm_ndjson(LOG_DIR, device, session_id)
+        if not os.path.exists(path):
+            return {
+                "ok": True,
+                "ready": False,
+                "reason": "no_window_llm_file_yet",
+                "device": device,
+                "session_id": session_id,
+            }
+
+        # 3) ndjson 읽어서 통계 계산
+        total = 0
+        counts = Counter()
+        last_idx = -1
+
+        for rec in window_analyze._iter_ndjson(path):
+            total += 1
+            stype = rec.get("screen_type")
+            if stype:
+                counts[stype] += 1
+            idx = rec.get("window_index")
+            if isinstance(idx, int):
+                last_idx = max(last_idx, idx)
+
+        if total == 0:
+            return {
+                "ok": True,
+                "ready": False,
+                "reason": "no_records_in_window_llm",
+                "device": device,
+                "session_id": session_id,
+            }
+
+        counts_dict = {k: int(v) for k, v in counts.items()}
+        shares = {k: (counts_dict[k] / float(total)) for k in counts_dict}
+
+        return {
+            "ok": True,
+            "ready": True,   # ← 최소 1개 윈도우 결과만 있어도 ready 로 봄
+            "device": device,
+            "session_id": session_id,
+            "total_windows": total,
+            "last_window_index": last_idx,
+            "counts": counts_dict,
+            "shares": shares,
+        }
 
 
 
