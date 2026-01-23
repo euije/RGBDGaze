@@ -141,3 +141,4 @@ cython_debug/
 *.png
 *.ndjson
 *.pkl
+GazeEstimation/logs/**
